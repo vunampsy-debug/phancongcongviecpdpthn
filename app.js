@@ -106,7 +106,7 @@ function bindEvents() {
     await loadAllData();
   });
 
-  $("#refreshBtn").addEventListener("click", () => loadAllData({ force: true }));
+  $("#refreshBtn").addEventListener("click", () => loadAllData({ refresh: true }));
   $("#openCreateTaskBtn").addEventListener("click", () => openTaskDialog());
   $("#closeDialogBtn").addEventListener("click", closeTaskDialog);
   $("#cancelTaskBtn").addEventListener("click", closeTaskDialog);
@@ -154,28 +154,20 @@ async function loadAllData(options = {}) {
     return;
   }
 
-  const force = options && options.force === true;
+  const refresh = options && options.refresh === true;
   setSyncing(true);
-  showStatus(force ? "Đang đồng bộ lại dữ liệu mới nhất từ Google Spreadsheet..." : "Đang tải dữ liệu từ Google Spreadsheet...", "info");
+  showStatus(refresh ? "Đang đọc lại dữ liệu mới nhất từ Google Spreadsheet..." : "Đang tải dữ liệu từ Google Spreadsheet...", "info");
 
   try {
-    let data;
-    try {
-      data = await apiGet("bootstrap", force ? { force: "1" } : {});
-    } catch (bootstrapErr) {
-      // Fallback cho trường hợp Apps Script cũ chưa có action bootstrap.
-      const [meta, taskResult] = await Promise.all([
-        apiGet("meta"),
-        apiGet("tasks")
-      ]);
-      data = { ...meta, tasks: Array.isArray(taskResult.tasks) ? taskResult.tasks : [] };
-    }
+    const data = await apiGet("bootstrap", refresh ? { refresh: "1" } : {});
 
     state.meta = {
       spreadsheetName: data.spreadsheetName,
       spreadsheetId: data.spreadsheetId,
       timezone: data.timezone,
-      sheets: Array.isArray(data.sheets) ? data.sheets : []
+      sheets: Array.isArray(data.sheets) ? data.sheets : [],
+      people: Array.isArray(data.people) ? data.people : [],
+      categories: Array.isArray(data.categories) ? data.categories : []
     };
     state.tasks = normalizeTasks(data.tasks);
 
@@ -194,7 +186,7 @@ async function loadAllData(options = {}) {
 async function reloadSheets(sheetNames = []) {
   const names = unique(sheetNames.filter(Boolean));
   if (!names.length) {
-    await loadAllData({ force: true });
+    await loadAllData({ refresh: true });
     return;
   }
 
@@ -202,7 +194,7 @@ async function reloadSheets(sheetNames = []) {
   showStatus(`Đang đồng bộ nhanh ${names.length} tab vừa thay đổi...`, "info");
 
   try {
-    const results = await Promise.all(names.map((sheetName) => apiGet("tasks", { sheetName, force: "1" })));
+    const results = await Promise.all(names.map((sheetName) => apiGet("tasks", { sheetName, refresh: "1" })));
     state.tasks = state.tasks.filter((task) => !names.includes(task.sheetName));
     results.forEach((result) => {
       state.tasks.push(...normalizeTasks(result.tasks));
@@ -215,7 +207,7 @@ async function reloadSheets(sheetNames = []) {
   } catch (err) {
     console.error(err);
     showStatus(`Đồng bộ nhanh không thành công, đang tải lại toàn bộ dữ liệu: ${err.message}`, "error");
-    await loadAllData({ force: true });
+    await loadAllData({ refresh: true });
   } finally {
     setSyncing(false);
   }
@@ -322,13 +314,13 @@ async function saveHeaders() {
   headers[2] = "Hạng mục công việc";
 
   try {
-    await apiPost("saveHeaders", {
+    const response = await apiPost("saveHeaders", {
       sheetName: els.settingsWeek.value,
       mode: els.applyHeaderMode.value,
       headers
     });
     showStatus("Đã lưu hàng 2 của bảng.", "success");
-    await loadAllData();
+    await reloadSheets(response.result?.updatedSheets || [els.settingsWeek.value]);
   } catch (err) {
     showStatus(`Không lưu được header: ${err.message}`, "error");
   }
@@ -339,10 +331,11 @@ async function addCategory() {
   if (!category) return showStatus("Nhập tên hạng mục trước khi thêm.", "error");
 
   try {
-    await apiPost("addCategory", { category });
+    const response = await apiPost("addCategory", { category });
     els.newCategoryInput.value = "";
-    showStatus("Đã thêm hạng mục công việc.", "success");
-    await loadAllData();
+    state.meta.categories = unique([...(state.meta?.categories || []), response.result?.category || category]);
+    hydrateControls();
+    showStatus(response.result?.created === false ? "Hạng mục này đã có trong danh sách." : "Đã thêm hạng mục công việc.", "success");
   } catch (err) {
     showStatus(`Không thêm được hạng mục: ${err.message}`, "error");
   }
@@ -572,13 +565,21 @@ async function saveTask(event) {
     return;
   }
 
+  const originalTask = state.editingTask ? { ...state.editingTask } : null;
+
   try {
-    const result = await apiPost(task.rowNumber ? "updateTask" : "createTask", { task });
+    const response = await apiPost(task.rowNumber ? "updateTask" : "createTask", { task });
+    const savedTask = response.result?.task;
     closeTaskDialog();
     showStatus("Đã lưu công việc vào Google Spreadsheet.", "success");
-    const changedSheets = [task.sheetName];
-    if (task.originalSheetName && task.originalSheetName !== task.sheetName) changedSheets.push(task.originalSheetName);
-    await reloadSheets(changedSheets);
+
+    if (savedTask) {
+      upsertTaskLocally(savedTask, originalTask);
+    } else {
+      const changedSheets = [task.sheetName];
+      if (task.originalSheetName && task.originalSheetName !== task.sheetName) changedSheets.push(task.originalSheetName);
+      await reloadSheets(changedSheets);
+    }
   } catch (err) {
     showStatus(`Không lưu được công việc: ${err.message}`, "error");
   }
@@ -589,18 +590,43 @@ async function deleteTask() {
   const ok = confirm("Xóa nội dung nhãn công việc này khỏi Google Sheet?");
   if (!ok) return;
 
+  const deletedTask = { ...state.editingTask };
+
   try {
     await apiPost("deleteTask", {
-      sheetName: state.editingTask.sheetName,
-      rowNumber: state.editingTask.rowNumber
+      sheetName: deletedTask.sheetName,
+      rowNumber: deletedTask.rowNumber
     });
-    const changedSheet = state.editingTask.sheetName;
     closeTaskDialog();
+    state.tasks = state.tasks.filter((task) => !isSameTaskLocation(task, deletedTask.sheetName, deletedTask.rowNumber));
+    refreshLocalViews();
     showStatus("Đã xóa nhãn công việc.", "success");
-    await reloadSheets([changedSheet]);
   } catch (err) {
     showStatus(`Không xóa được công việc: ${err.message}`, "error");
   }
+}
+
+function upsertTaskLocally(savedTask, originalTask) {
+  if (originalTask?.rowNumber) {
+    state.tasks = state.tasks.filter((task) => !isSameTaskLocation(task, originalTask.sheetName, originalTask.rowNumber));
+  }
+
+  state.tasks = state.tasks.filter((task) => !isSameTaskLocation(task, savedTask.sheetName, savedTask.rowNumber));
+  state.tasks.push(savedTask);
+
+  const sheetMeta = state.meta?.sheets?.find((sheet) => sheet.name === savedTask.sheetName);
+  if (sheetMeta) sheetMeta.lastRow = Math.max(Number(sheetMeta.lastRow) || 0, Number(savedTask.rowNumber) || 0);
+  refreshLocalViews();
+}
+
+function isSameTaskLocation(task, sheetName, rowNumber) {
+  return task?.sheetName === sheetName && Number(task?.rowNumber) === Number(rowNumber);
+}
+
+function refreshLocalViews() {
+  hydrateControls();
+  applyFilters();
+  renderDashboard();
 }
 
 
